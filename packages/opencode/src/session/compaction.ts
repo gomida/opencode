@@ -22,6 +22,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import { trace } from "@/trace/jsonl"
 
 export const Event = SessionCompactionEvent
 
@@ -293,6 +294,13 @@ const layer = Layer.effect(
       auto: boolean
       overflow?: boolean
     }) {
+      trace()?.write("compaction.process.start", {
+        sessionID: input.sessionID,
+        parentID: input.parentID,
+        messageCount: input.messages.length,
+        auto: input.auto,
+        overflow: input.overflow === true,
+      })
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
         throw new Error(`Compaction parent must be a user message: ${input.parentID}`)
@@ -338,6 +346,17 @@ const layer = Layer.effect(
         messages: history.filter((_, index) => !hidden.has(index)),
         cfg,
         model,
+      })
+      trace()?.write("compaction.context.selected", {
+        sessionID: input.sessionID,
+        parentID: input.parentID,
+        modelID: model.id,
+        providerID: model.providerID,
+        historyCount: history.length,
+        hiddenCount: hidden.size,
+        headCount: selected.head.length,
+        tailStartID: selected.tail_start_id,
+        previousSummary: previousSummary !== undefined,
       })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
@@ -399,6 +418,15 @@ const layer = Layer.effect(
           },
         ],
         model,
+      })
+      trace()?.write("compaction.process.result", {
+        sessionID: input.sessionID,
+        parentID: input.parentID,
+        assistantID: processor.message.id,
+        result,
+        hasError: processor.message.error !== undefined,
+        finish: processor.message.finish,
+        tokens: processor.message.tokens,
       })
 
       if (result === "compact") {
@@ -517,6 +545,14 @@ const layer = Layer.effect(
       auto: boolean
       overflow?: boolean
     }) {
+      trace()?.write("compaction.create", {
+        sessionID: input.sessionID,
+        agent: input.agent,
+        providerID: input.model.providerID,
+        modelID: input.model.modelID,
+        auto: input.auto,
+        overflow: input.overflow === true,
+      })
       const msg = yield* session.updateMessage({
         id: MessageID.ascending(),
         role: "user",

@@ -31,6 +31,7 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { MessageV2 } from "./message-v2"
 import type { InstanceContext } from "../project/instance-context"
 import { InstanceState } from "@/effect/instance-state"
+import { trace } from "@/trace/jsonl"
 import { Snapshot } from "@/snapshot"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
@@ -636,6 +637,13 @@ const layer: Layer.Layer<
 
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        trace()?.write("session.part.update", {
+          sessionID: part.sessionID,
+          messageID: part.messageID,
+          partID: part.id,
+          type: part.type,
+          synthetic: "synthetic" in part ? part.synthetic : undefined,
+        })
         yield* events.publish(SessionV1.Event.PartUpdated, {
           sessionID: part.sessionID,
           part: structuredClone(part),

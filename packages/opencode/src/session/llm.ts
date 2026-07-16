@@ -29,6 +29,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { trace, verbose as traceVerbose } from "@/trace/jsonl"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -91,6 +92,19 @@ const live: Layer.Layer<
         agent: input.agent.name,
         mode: input.agent.mode,
       })
+      trace()?.write("llm.stream.start", {
+        sessionID: input.sessionID,
+        parentSessionID: input.parentSessionID,
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        small: input.small ?? false,
+        agent: input.agent.name,
+        mode: input.agent.mode,
+        systemCount: input.system.length,
+        messageCount: input.messages.length,
+        toolCount: Object.keys(input.tools).length,
+        toolChoice: input.toolChoice,
+      })
 
       const [language, cfg, item, info] = yield* Effect.all(
         [
@@ -110,6 +124,21 @@ const live: Layer.Layer<
         plugin,
         flags,
         isWorkflow,
+      })
+      trace()?.write("llm.request.prepared", {
+        sessionID: input.sessionID,
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        runtime: flags.experimentalNativeLlm ? "native-or-ai-sdk" : "ai-sdk",
+        systemCount: prepared.system.length,
+        messageCount: prepared.messages.length,
+        toolCount: Object.keys(prepared.tools).length,
+        activeToolCount: Object.keys(prepared.tools).filter((x) => x !== "invalid").length,
+        maxOutputTokens: prepared.params.maxOutputTokens,
+        temperature: prepared.params.temperature,
+        topP: prepared.params.topP,
+        topK: prepared.params.topK,
+        messages: traceVerbose() ? prepared.messages : undefined,
       })
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
@@ -241,6 +270,12 @@ const live: Layer.Layer<
           abort: input.abort,
         })
         if (native.type === "supported") {
+          trace()?.write("llm.runtime.selected", {
+            sessionID: input.sessionID,
+            providerID: input.model.providerID,
+            modelID: input.model.id,
+            runtime: "native",
+          })
           yield* Effect.logInfo("llm runtime selected", {
             "llm.runtime": "native",
             "llm.provider": input.model.providerID,
@@ -251,6 +286,14 @@ const live: Layer.Layer<
             stream: native.stream,
           }
         }
+        trace()?.write("llm.runtime.fallback", {
+          sessionID: input.sessionID,
+          providerID: input.model.providerID,
+          modelID: input.model.id,
+          from: "native",
+          to: "ai-sdk",
+          reason: native.reason,
+        })
         yield* Effect.logInfo("llm runtime selected", {
           "llm.runtime": "ai-sdk",
           "llm.provider": input.model.providerID,
@@ -268,6 +311,12 @@ const live: Layer.Layer<
         })
       }
 
+      trace()?.write("llm.runtime.selected", {
+        sessionID: input.sessionID,
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        runtime: "ai-sdk",
+      })
       yield* Effect.logInfo("llm runtime selected", {
         "llm.runtime": "ai-sdk",
         "llm.provider": input.model.providerID,
@@ -373,7 +422,22 @@ const live: Layer.Layer<
             return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
-              Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
+              Stream.mapEffect((event) =>
+                Effect.gen(function* () {
+                  const events = yield* LLMAISDK.toLLMEvents(state, event)
+                  trace()?.write("llm.stream.chunk", {
+                    sessionID: input.sessionID,
+                    providerID: input.model.providerID,
+                    modelID: input.model.id,
+                    inputType:
+                      typeof event === "object" && event !== null && "type" in event ? String(event.type) : typeof event,
+                    outputTypes: events.map((item) => item.type),
+                    event: traceVerbose() ? event : undefined,
+                    output: traceVerbose() ? events : undefined,
+                  })
+                  return events
+                }),
+              ),
               Stream.flatMap((events) => Stream.fromIterable(events)),
             )
           }),
