@@ -111,7 +111,7 @@ class PredecessorReviewBodyTest(unittest.TestCase):
 
         self.assertEqual(review_body["messages"][: len(request["messages"])], request["messages"])
         self.assertEqual(review_body["tools"], request["tools"])
-        self.assertEqual(review_body["tool_choice"], request["tool_choice"])
+        self.assertEqual(review_body["tool_choice"], "none")
         self.assertEqual(review_body["model"], request["model"])
         self.assertEqual(review_body["top_p"], request["top_p"])
         self.assertEqual(review_body["extra_body"], request["extra_body"])
@@ -119,6 +119,7 @@ class PredecessorReviewBodyTest(unittest.TestCase):
         self.assertNotIn("stream_options", review_body)
         self.assertEqual(review_body["temperature"], 0)
         self.assertEqual(review_body["max_tokens"], 2048)
+        self.assertIn("tool_choice", metadata["intentional_overrides"])
 
         self.assertEqual(stable_sha256(request), original_hash)
         self.assertEqual(metadata["predecessor_context_id"], predecessor_context_id(request, 2))

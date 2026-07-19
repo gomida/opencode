@@ -59,11 +59,13 @@ or review timing. If exact tokenization is unavailable, the proxy records the
 error and does not trigger a review from a character-count estimate.
 
 The predecessor review must derive from the preserved pre-compaction request,
-not from a shortened reconstruction.  The review request intentionally changes
-only transport/generation controls needed for logging (`stream`, `stream_options`,
-`temperature`, and `max_tokens`) and appends the successor trace as one extra
-user message.  Prompt-shaping fields such as `tools`, `tool_choice`, model
-metadata, provider extras, and the original message prefix are preserved.  The
+not from a shortened reconstruction. The review request appends the successor
+trace as one extra user message and intentionally changes transport/generation
+controls needed for logging (`stream`, `stream_options`, `temperature`, and
+`max_tokens`). It also sets `tool_choice` to `none` for this terminal review so
+the result is a human-readable final letter rather than another work step. The
+original tool definitions, model metadata, provider extras, and message prefix
+are preserved. The
 review log records a `predecessor_context_id` plus prompt-prefix hashes so a
 visualizer can treat the live predecessor request and the review request as the
 same G0 context.  vLLM request identifiers are not reused; prefix identity is

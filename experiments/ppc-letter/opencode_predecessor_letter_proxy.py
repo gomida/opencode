@@ -52,6 +52,7 @@ INTENTIONAL_REVIEW_OVERRIDES = {
     "stream_options",
     "temperature",
     "max_tokens",
+    "tool_choice",
 }
 
 
@@ -450,12 +451,15 @@ def build_predecessor_review_body(
 
     review_body = clone_json(base_body)
     review_body["messages"] = review_messages
-    # Streaming transport is disabled only so the proxy can record one review
-    # response object. Prompt-shaping fields such as tools/tool_choice remain
-    # from the preserved predecessor request.
+    # Streaming transport is disabled so the proxy can record one review
+    # response object. The predecessor's original tool definitions remain part
+    # of its context, but tool execution is disabled for this one terminal
+    # review: the required output is a human-readable final letter, not another
+    # work step or tool call.
     review_body["stream"] = False
     review_body.pop("stream_options", None)
     review_body["temperature"] = 0
+    review_body["tool_choice"] = "none"
     review_body["max_tokens"] = min(
         int(review_body.get("max_tokens") or review_max_tokens),
         review_max_tokens,
