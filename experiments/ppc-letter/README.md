@@ -22,6 +22,8 @@ OpenAI-compatible HTTP boundary between OpenCode and vLLM.
 | --- | --- |
 | `opencode_predecessor_letter_proxy.py` | OpenAI-compatible proxy that captures a predecessor request snapshot, accumulates post-compaction successor progress, asks the predecessor for a final letter, and injects that letter into the next successor request. |
 | `test_opencode_predecessor_letter_proxy.py` | Unit tests for the predecessor review request invariant. |
+| `gemini_native_predecessor_letter_proxy.py` | Gemini-native adapter that preserves thought signatures and implements the same repeated-compaction predecessor-letter state machine without an OpenAI translation. |
+| `test_gemini_native_predecessor_letter_proxy.py` | Unit tests for native compaction detection, response projection, and letter injection. |
 
 ## Minimal Flow
 
@@ -112,6 +114,38 @@ python3 experiments/ppc-letter/opencode_predecessor_letter_proxy.py \
 The API key is held only in process memory. Captured inbound headers may contain
 the deliberately non-secret local authorization value, but outbound headers and
 the real credential are never written to proxy artifacts.
+
+Gemini 3.5 tool loops require a thought signature returned with each function
+call to be replayed on the next request. A generic OpenAI-compatible provider
+may omit that provider-specific metadata even though the first tool call
+succeeds. Do not use the OpenAI-compatible mode for a Gemini 3.5 OpenCode tool
+loop unless that client has independently demonstrated signature replay.
+
+## Gemini native mode
+
+Use OpenCode's bundled `@ai-sdk/google` provider and point its `baseURL` at the
+native proxy. The proxy forwards native `contents`, `functionCall`,
+`functionResponse`, thought parts, and thought signatures without translating
+them to OpenAI messages. Stock OpenCode compaction calls therefore use the same
+native Gemini transport as ordinary task calls.
+
+```bash
+python3 experiments/ppc-letter/gemini_native_predecessor_letter_proxy.py \
+  --listen-host 127.0.0.1 \
+  --listen-port 8003 \
+  --upstream https://generativelanguage.googleapis.com/v1beta/ \
+  --model gemini-3.5-flash \
+  --api-key-file /run/secrets/gemini_api_key \
+  --log-dir /tmp/opencode-ppc-letter-native \
+  --successor-accum-tokens 250
+```
+
+The native counter sends every completed successor model message separately to
+Gemini `countTokens`. It includes visible text and `functionCall` parts and
+excludes thought parts, thought signatures, and function responses. A review
+uses native `generateContent` with JSON schema output and function calling set
+to `NONE`. The real API key is used only in outbound headers and remains absent
+from captured inbound requests and response artifacts.
 
 ## Relationship to Trace
 
