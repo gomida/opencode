@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from gemini_native_predecessor_letter_proxy import (
     State,
     is_compaction_request,
+    is_generation_path,
     merge_response,
     normalize_letter,
     render_progress,
@@ -16,6 +17,19 @@ from gemini_native_predecessor_letter_proxy import (
 
 
 class GeminiNativeProxyTest(unittest.TestCase):
+    def test_native_generation_path_accepts_streaming_and_nonstreaming(self):
+        self.assertTrue(
+            is_generation_path(
+                "/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse"
+            )
+        )
+        self.assertTrue(
+            is_generation_path("/v1beta/models/gemini-3.5-flash:generateContent")
+        )
+        self.assertFalse(
+            is_generation_path("/v1beta/models/gemini-3.5-flash:countTokens")
+        )
+
     def test_compaction_detection_scans_native_text_parts(self):
         self.assertTrue(
             is_compaction_request(

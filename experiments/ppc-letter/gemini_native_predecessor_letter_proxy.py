@@ -99,6 +99,11 @@ def is_compaction_request(request: dict) -> bool:
     return False
 
 
+def is_generation_path(path: str) -> bool:
+    operation = path.split("?", 1)[0].rsplit(":", 1)[-1]
+    return operation in {"generateContent", "streamGenerateContent"}
+
+
 def response_payloads(body: bytes, content_type: str) -> list[dict]:
     text = body.decode("utf-8", errors="replace")
     if "text/event-stream" not in content_type:
@@ -493,7 +498,7 @@ class Handler(BaseHTTPRequestHandler):
         native_generation = bool(
             self.command == "POST"
             and isinstance(request_json, dict)
-            and ("generateContent" in self.path)
+            and is_generation_path(self.path)
         )
         compaction = bool(native_generation and is_compaction_request(request_json))
         cycle = state.begin_compaction() if compaction else None
