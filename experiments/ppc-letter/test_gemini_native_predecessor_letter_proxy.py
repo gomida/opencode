@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 
 from gemini_native_predecessor_letter_proxy import (
     State,
+    extract_text,
     is_compaction_request,
     is_generation_path,
     merge_response,
@@ -17,6 +18,23 @@ from gemini_native_predecessor_letter_proxy import (
 
 
 class GeminiNativeProxyTest(unittest.TestCase):
+    def test_review_text_excludes_native_thought_parts(self):
+        payload = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"thought": True, "text": "analysis"},
+                            {"text": '{"status":"OK","letter":"Continue."}'},
+                        ]
+                    }
+                }
+            ]
+        }
+        self.assertEqual(
+            extract_text(payload), '{"status":"OK","letter":"Continue."}'
+        )
+
     def test_native_generation_path_accepts_streaming_and_nonstreaming(self):
         self.assertTrue(
             is_generation_path(

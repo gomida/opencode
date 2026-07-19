@@ -201,7 +201,11 @@ def extract_text(payload: dict) -> str:
     pieces = []
     for candidate in payload.get("candidates") or []:
         for part in (candidate.get("content") or {}).get("parts") or []:
-            if isinstance(part, dict) and part.get("text") is not None:
+            if (
+                isinstance(part, dict)
+                and part.get("thought") is not True
+                and part.get("text") is not None
+            ):
                 pieces.append(str(part["text"]))
     return "".join(pieces)
 
