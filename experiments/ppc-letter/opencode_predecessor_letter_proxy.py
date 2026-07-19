@@ -511,11 +511,57 @@ def upstream_assistant_message_token_count(
     upstream: str,
     model: str | None,
     message: dict,
+    api_key: str | None = None,
+    count_tokens_url: str | None = None,
 ) -> int:
     if message.get("role") != "assistant":
         raise ValueError("successor progress may contain assistant messages only")
     if "reasoning" in message or "reasoning_content" in message:
         raise ValueError("successor progress must not contain reasoning fields")
+    if count_tokens_url is not None:
+        parts = []
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            parts.append({"text": content})
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+                    parts.append({"text": str(item["text"])})
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {"raw": arguments}
+            if not isinstance(arguments, dict):
+                arguments = {"value": arguments}
+            parts.append(
+                {
+                    "functionCall": {
+                        "name": str(function.get("name") or "unknown"),
+                        "args": arguments,
+                    }
+                }
+            )
+        if not parts:
+            parts.append({"text": ""})
+        response = requests.post(
+            count_tokens_url,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key or "",
+            },
+            data=json.dumps({"contents": [{"role": "model", "parts": parts}]}).encode("utf-8"),
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if "totalTokens" in data:
+            return int(data["totalTokens"])
+        raise RuntimeError(f"unexpected Gemini countTokens response keys: {sorted(data)}")
+
     payload = {
         "messages": [message],
         "add_generation_prompt": False,
@@ -542,16 +588,28 @@ def successor_token_count(
     upstream: str,
     model: str | None,
     messages: list[dict],
+    api_key: str | None = None,
+    count_tokens_url: str | None = None,
 ) -> tuple[int | None, str, str | None]:
     if not messages:
         return 0, "empty", None
     try:
         return (
             sum(
-                upstream_assistant_message_token_count(upstream, model, message)
+                upstream_assistant_message_token_count(
+                    upstream,
+                    model,
+                    message,
+                    api_key=api_key,
+                    count_tokens_url=count_tokens_url,
+                )
                 for message in messages
             ),
-            "upstream_chat_message_sum",
+            (
+                "gemini_native_count_tokens_sum"
+                if count_tokens_url is not None
+                else "upstream_chat_message_sum"
+            ),
             None,
         )
     except Exception as exc:
@@ -589,6 +647,9 @@ class ProxyState:
         predecessor_request: Path | None,
         review_max_tokens: int,
         successor_accum_tokens: int,
+        upstream_mode: str = "openai",
+        api_key: str | None = None,
+        count_tokens_url: str | None = None,
     ):
         self.upstream = upstream.rstrip("/") + "/"
         self.log_dir = log_dir
@@ -602,6 +663,9 @@ class ProxyState:
         self.last_non_compaction_response_message: dict | None = None
         self.review_max_tokens = review_max_tokens
         self.successor_accum_tokens = successor_accum_tokens
+        self.upstream_mode = upstream_mode
+        self.api_key = api_key
+        self.count_tokens_url = count_tokens_url
         self.lock = threading.Lock()
         self.seq = 0
         self.chat_request_count = 0
@@ -610,6 +674,21 @@ class ProxyState:
         self.compaction_event_count = 0
         self.cycles: dict[int, GenerationCycle] = {}
         self.active_cycle: GenerationCycle | None = None
+
+    def resolve_upstream_url(self, path: str) -> str:
+        normalized = path.lstrip("/")
+        if self.upstream_mode == "gemini-openai" and normalized.startswith("v1/"):
+            normalized = normalized[3:]
+        return urljoin(self.upstream, normalized)
+
+    def authorize_upstream_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        if self.api_key is None:
+            return headers
+        authorized = {
+            key: value for key, value in headers.items() if key.lower() != "authorization"
+        }
+        authorized["Authorization"] = f"Bearer {self.api_key}"
+        return authorized
 
     def next_seq(self) -> int:
         with self.lock:
@@ -815,6 +894,8 @@ class ProxyState:
             self.upstream,
             model,
             assistant_messages,
+            api_key=self.api_key,
+            count_tokens_url=self.count_tokens_url,
         )
         ready_for_review = (
             progress_tokens is not None
@@ -839,7 +920,11 @@ class ProxyState:
                 "count_contract": {
                     "included": ["assistant content", "assistant tool_calls"],
                     "excluded": ["reasoning", "reasoning_content", "tool results"],
-                    "method": "sum of vLLM /tokenize counts for individually chat-templated completed assistant messages",
+                    "method": (
+                        "sum of Gemini native countTokens results for individually represented completed assistant messages"
+                        if token_source == "gemini_native_count_tokens_sum"
+                        else "sum of vLLM /tokenize counts for individually chat-templated completed assistant messages"
+                    ),
                 },
                 "text": progress_text,
             },
@@ -950,8 +1035,8 @@ def run_predecessor_review(
         },
     )
     response = requests.post(
-        urljoin(state.upstream, "v1/chat/completions"),
-        headers={"Content-Type": "application/json"},
+        state.resolve_upstream_url("v1/chat/completions"),
+        headers=state.authorize_upstream_headers({"Content-Type": "application/json"}),
         data=json.dumps(review_body).encode("utf-8"),
         timeout=None,
     )
@@ -1099,8 +1184,9 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
 
-        upstream_url = urljoin(state.upstream, path)
+        upstream_url = state.resolve_upstream_url(path)
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "host"}
+        headers = state.authorize_upstream_headers(headers)
         try:
             response = requests.request(
                 self.command,
@@ -1175,11 +1261,22 @@ def main() -> int:
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, default=8003)
     parser.add_argument("--upstream", default="http://127.0.0.1:8000")
+    parser.add_argument("--upstream-mode", choices=("openai", "gemini-openai"), default="openai")
+    parser.add_argument("--api-key-file", type=Path)
+    parser.add_argument("--count-tokens-url")
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--predecessor-request", type=Path)
     parser.add_argument("--review-max-tokens", type=int, default=2048)
     parser.add_argument("--successor-accum-tokens", type=int, default=DEFAULT_SUCCESSOR_ACCUM_TOKENS)
     args = parser.parse_args()
+
+    api_key = None
+    if args.api_key_file is not None:
+        api_key = args.api_key_file.read_text(encoding="utf-8").strip()
+        if not api_key:
+            raise ValueError("API key file is empty")
+    if args.upstream_mode == "gemini-openai" and (api_key is None or args.count_tokens_url is None):
+        raise ValueError("Gemini OpenAI mode requires --api-key-file and --count-tokens-url")
 
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), Handler)
     server.state = ProxyState(  # type: ignore[attr-defined]
@@ -1188,6 +1285,9 @@ def main() -> int:
         predecessor_request=args.predecessor_request,
         review_max_tokens=args.review_max_tokens,
         successor_accum_tokens=args.successor_accum_tokens,
+        upstream_mode=args.upstream_mode,
+        api_key=api_key,
+        count_tokens_url=args.count_tokens_url,
     )
     print(
         f"predecessor-letter proxy listening on {args.listen_host}:{args.listen_port} -> {args.upstream}",

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Regression tests for the PPC predecessor-letter proxy."""
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from opencode_predecessor_letter_proxy import (
     ProxyState,
@@ -15,6 +16,7 @@ from opencode_predecessor_letter_proxy import (
     predecessor_context_id,
     render_successor_text,
     stable_sha256,
+    upstream_assistant_message_token_count,
 )
 
 
@@ -167,6 +169,70 @@ class PredecessorReviewBodyTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             normalize_predecessor_letter('{"status":"MAYBE","letter":"x"}')
+
+    def test_gemini_mode_resolves_openai_path_and_replaces_dummy_authorization(self):
+        with TemporaryDirectory() as tmp:
+            state = ProxyState(
+                upstream="https://generativelanguage.googleapis.com/v1beta/openai/",
+                log_dir=Path(tmp),
+                predecessor_request=None,
+                review_max_tokens=2048,
+                successor_accum_tokens=250,
+                upstream_mode="gemini-openai",
+                api_key="secret-key",
+                count_tokens_url="https://generativelanguage.googleapis.com/v1beta/models/gemini:countTokens",
+            )
+            self.assertEqual(
+                state.resolve_upstream_url("/v1/chat/completions"),
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            )
+            self.assertEqual(
+                state.authorize_upstream_headers({"aUtHoRiZaTiOn": "Bearer local", "X-Test": "1"}),
+                {"Authorization": "Bearer secret-key", "X-Test": "1"},
+            )
+
+    def test_gemini_native_count_tokens_preserves_content_and_tool_call(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"totalTokens": 17}
+        message = {
+            "role": "assistant",
+            "content": "Inspect the file.",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "read",
+                        "arguments": '{"filePath":"engineio/server.py"}',
+                    }
+                }
+            ],
+        }
+        with patch(
+            "opencode_predecessor_letter_proxy.requests.post",
+            return_value=response,
+        ) as post:
+            count = upstream_assistant_message_token_count(
+                upstream="https://generativelanguage.googleapis.com/v1beta/openai/",
+                model="gemini-3.5-flash",
+                message=message,
+                api_key="secret-key",
+                count_tokens_url="https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:countTokens",
+            )
+
+        self.assertEqual(count, 17)
+        self.assertEqual(post.call_args.kwargs["headers"]["x-goog-api-key"], "secret-key")
+        payload = json.loads(post.call_args.kwargs["data"])
+        self.assertEqual(payload["contents"][0]["role"], "model")
+        self.assertEqual(payload["contents"][0]["parts"][0], {"text": "Inspect the file."})
+        self.assertEqual(
+            payload["contents"][0]["parts"][1],
+            {
+                "functionCall": {
+                    "name": "read",
+                    "args": {"filePath": "engineio/server.py"},
+                }
+            },
+        )
 
     def test_review_includes_predecessor_generated_response_when_available(self):
         request = self.sample_request()

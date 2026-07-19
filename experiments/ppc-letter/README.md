@@ -1,6 +1,8 @@
 # PPC Letter Experiment
 
-This experiment branch is intentionally based on `dev-trace`.
+This experiment branch is intentionally based on the implementation first used
+for experiment 0002. The `gemini-letter` branch adds an opt-in Gemini transport
+adapter without changing OpenCode core execution.
 
 Branch policy:
 
@@ -8,6 +10,8 @@ Branch policy:
 - `dev-trace-experiment-ppc-letter` adds the PPC predecessor-letter experiment on top of `dev-trace`.
 - Future trace-only improvements should be merged into `dev-trace` first, then merged or rebased into this experiment branch.
 - Other experiments should branch from `dev-trace`, not from this branch.
+- `gemini-letter` is a transport-specific experiment branch and is not a new
+  default for unrelated experiments.
 
 The experiment keeps OpenCode core execution unchanged and interposes at the
 OpenAI-compatible HTTP boundary between OpenCode and vLLM.
@@ -78,6 +82,36 @@ Run the local regression test with:
 ```bash
 python3 experiments/ppc-letter/test_opencode_predecessor_letter_proxy.py
 ```
+
+## Gemini OpenAI-compatible mode
+
+The proxy can forward OpenCode's OpenAI-compatible requests to Gemini while
+preserving the predecessor-letter state machine. In this mode it replaces the
+client's dummy local authorization value only on the outbound request and uses
+Gemini's native `countTokens` method to count each completed assistant message.
+The projection remains assistant visible content plus complete assistant tool
+calls; reasoning fields and tool-result messages remain excluded.
+
+Keep the Gemini credential in a mode-0600 file on a memory-backed filesystem,
+such as `/run/secrets/gemini_api_key`. Do not place the value in a command line,
+container environment, configuration file, log, image, or experiment archive.
+
+```bash
+python3 experiments/ppc-letter/opencode_predecessor_letter_proxy.py \
+  --listen-host 127.0.0.1 \
+  --listen-port 8003 \
+  --upstream https://generativelanguage.googleapis.com/v1beta/openai/ \
+  --upstream-mode gemini-openai \
+  --api-key-file /run/secrets/gemini_api_key \
+  --count-tokens-url \
+    https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:countTokens \
+  --log-dir /tmp/opencode-ppc-letter \
+  --successor-accum-tokens 250
+```
+
+The API key is held only in process memory. Captured inbound headers may contain
+the deliberately non-secret local authorization value, but outbound headers and
+the real credential are never written to proxy artifacts.
 
 ## Relationship to Trace
 
