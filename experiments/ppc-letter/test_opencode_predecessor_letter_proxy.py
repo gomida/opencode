@@ -11,6 +11,7 @@ from opencode_predecessor_letter_proxy import (
     assistant_message_from_successor_record,
     build_predecessor_review_body,
     is_compaction_request_body,
+    normalize_predecessor_letter,
     predecessor_context_id,
     render_successor_text,
     stable_sha256,
@@ -120,6 +121,11 @@ class PredecessorReviewBodyTest(unittest.TestCase):
         self.assertEqual(review_body["temperature"], 0)
         self.assertEqual(review_body["max_tokens"], 2048)
         self.assertIn("tool_choice", metadata["intentional_overrides"])
+        self.assertEqual(review_body["response_format"]["type"], "json_schema")
+        schema = review_body["response_format"]["json_schema"]["schema"]
+        self.assertEqual(schema["required"], ["status", "letter"])
+        self.assertFalse(schema["additionalProperties"])
+        self.assertIn("response_format", metadata["intentional_overrides"])
 
         self.assertEqual(stable_sha256(request), original_hash)
         self.assertEqual(metadata["predecessor_context_id"], predecessor_context_id(request, 2))
@@ -149,6 +155,18 @@ class PredecessorReviewBodyTest(unittest.TestCase):
         self.assertEqual(request["tools"][0]["function"]["description"], "Read a file")
         self.assertEqual(request["messages"][0]["content"], "You are OpenCode.")
         self.assertTrue(metadata["prefix_invariant_ok"])
+
+    def test_schema_letter_is_normalized_for_injection(self):
+        normalized = normalize_predecessor_letter(
+            '{"status":"warn","letter":"Check the failing ASGI routing test."}'
+        )
+        self.assertEqual(normalized["status"], "WARN")
+        self.assertEqual(
+            normalized["rendered"],
+            "STATUS: WARN\nLETTER:\nCheck the failing ASGI routing test.",
+        )
+        with self.assertRaises(ValueError):
+            normalize_predecessor_letter('{"status":"MAYBE","letter":"x"}')
 
     def test_review_includes_predecessor_generated_response_when_available(self):
         request = self.sample_request()

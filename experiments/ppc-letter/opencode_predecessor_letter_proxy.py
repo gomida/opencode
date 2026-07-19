@@ -53,6 +53,7 @@ INTENTIONAL_REVIEW_OVERRIDES = {
     "temperature",
     "max_tokens",
     "tool_choice",
+    "response_format",
 }
 
 
@@ -64,10 +65,9 @@ final letter to the successor with direction.  This is not an ongoing teaching
 loop; it is your last note before retirement.  Do not solve the task from
 scratch.
 
-Use this final-letter block format:
-STATUS: OK or WARN
-LETTER:
-<short final letter to the successor>
+Return only the structured predecessor-letter object requested by the response
+schema. Set `status` to `OK` or `WARN` and put the short final letter in
+`letter`.
 
 Accumulated successor progress starts here:
 """
@@ -84,11 +84,26 @@ markup, and do not continue solving the task yourself.  The purpose of the
 letter is to warn or reassure the successor about its accumulated post-
 compaction direction.
 
-Include this final-letter block format:
-STATUS: OK or WARN
-LETTER:
-<short final letter to the successor>
+Return only the schema-conforming object with `status` and `letter`.
 """
+
+
+PREDECESSOR_LETTER_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "predecessor_letter",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["OK", "WARN"]},
+                "letter": {"type": "string", "minLength": 1},
+            },
+            "required": ["status", "letter"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 def utc_now() -> str:
@@ -288,6 +303,23 @@ def extract_nonstream_text(payload: dict) -> str:
     return "\n".join(piece for piece in pieces if piece)
 
 
+def normalize_predecessor_letter(text: str) -> dict:
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("predecessor letter is not an object")
+    status = str(payload.get("status") or "").upper()
+    letter = str(payload.get("letter") or "").strip()
+    if status not in {"OK", "WARN"}:
+        raise ValueError(f"invalid predecessor status: {status!r}")
+    if not letter:
+        raise ValueError("predecessor letter is empty")
+    return {
+        "status": status,
+        "letter": letter,
+        "rendered": f"STATUS: {status}\nLETTER:\n{letter}",
+    }
+
+
 def compact_value(value, max_chars: int = 240) -> str:
     if isinstance(value, str):
         text = value
@@ -460,6 +492,7 @@ def build_predecessor_review_body(
     review_body.pop("stream_options", None)
     review_body["temperature"] = 0
     review_body["tool_choice"] = "none"
+    review_body["response_format"] = clone_json(PREDECESSOR_LETTER_RESPONSE_FORMAT)
     review_body["max_tokens"] = min(
         int(review_body.get("max_tokens") or review_max_tokens),
         review_max_tokens,
@@ -824,13 +857,26 @@ class ProxyState:
                 return
             cycle.review_started = True
             review_segments = clone_json(cycle.successor_segments)
-        letter = run_predecessor_review(
-            self,
-            cycle,
-            review_segments,
-            progress_tokens,
-            token_source,
-        )
+        try:
+            letter = run_predecessor_review(
+                self,
+                cycle,
+                review_segments,
+                progress_tokens,
+                token_source,
+            )
+        except Exception as exc:
+            dump_json(
+                self.log_dir / f"generation-{event_index:06d}-predecessor-review-error.json",
+                {
+                    "event_index": event_index,
+                    "predecessor_generation": generation - 1,
+                    "successor_generation": generation,
+                    "time": utc_now(),
+                    "error": repr(exc),
+                },
+            )
+            letter = None
         with self.lock:
             active = self.active_cycle
             if active is not None and active.event_index == event_index:
@@ -913,6 +959,14 @@ def run_predecessor_review(
         response_json = response.json()
     except Exception:
         response_json = {"raw": response.text}
+    normalized = None
+    normalization_error = None
+    try:
+        normalized = normalize_predecessor_letter(
+            extract_nonstream_text(response_json).strip()
+        )
+    except Exception as exc:
+        normalization_error = repr(exc)
     dump_json(
         state.log_dir / f"{cycle.artifact_prefix}-predecessor-review-response.json",
         {
@@ -922,9 +976,15 @@ def run_predecessor_review(
             "time": utc_now(),
             "status_code": response.status_code,
             "body": response_json,
+            "normalized_letter": normalized,
+            "normalization_error": normalization_error,
         },
     )
-    return extract_nonstream_text(response_json).strip()
+    if normalized is None:
+        raise RuntimeError(
+            f"predecessor did not return a schema-conforming letter: {normalization_error}"
+        )
+    return normalized["rendered"]
 
 
 class Handler(BaseHTTPRequestHandler):

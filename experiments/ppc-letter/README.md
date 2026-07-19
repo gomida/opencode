@@ -62,8 +62,10 @@ The predecessor review must derive from the preserved pre-compaction request,
 not from a shortened reconstruction. The review request appends the successor
 trace as one extra user message and intentionally changes transport/generation
 controls needed for logging (`stream`, `stream_options`, `temperature`, and
-`max_tokens`). It also sets `tool_choice` to `none` for this terminal review so
-the result is a human-readable final letter rather than another work step. The
+`max_tokens`). It also sets `tool_choice` to `none` and requires a strict
+`status`/`letter` JSON schema for this terminal review. The proxy validates that
+object and renders it as a human-readable `STATUS`/`LETTER` block, preventing
+the model from substituting another work step or textual tool-call markup. The
 original tool definitions, model metadata, provider extras, and message prefix
 are preserved. The
 review log records a `predecessor_context_id` plus prompt-prefix hashes so a
