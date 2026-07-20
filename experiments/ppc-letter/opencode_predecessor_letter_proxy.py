@@ -424,9 +424,9 @@ def assistant_message_from_successor_record(record: dict) -> dict | None:
 def render_successor_text(record: dict) -> str:
     """Render only the completed, externally visible assistant message.
 
-    Reasoning fields are intentionally excluded. Tool results are user/tool-side
-    messages in a later request and therefore never enter this assistant response
-    projection. Assistant tool calls remain present with their complete arguments.
+    Reasoning fields are intentionally excluded. Assistant tool calls remain
+    present with their complete arguments. Tool results are collected separately
+    from the following request after OpenCode executes each call.
     """
 
     message = assistant_message_from_successor_record(record)
@@ -438,13 +438,16 @@ def render_successor_text(record: dict) -> str:
 def render_successor_progress(segments: list[dict]) -> str:
     blocks = []
     for segment in segments:
-        header = f"Successor response {segment['response_index']}"
+        if segment.get("kind") == "tool_result":
+            header = f"Successor tool result {segment['progress_index']}"
+        else:
+            header = f"Successor response {segment.get('response_index')}"
         if segment.get("seq") is not None:
             header += f" (proxy seq {segment['seq']})"
         rendered = segment.get("text")
         if rendered is None:
             rendered = json.dumps(
-                segment["assistant_message"],
+                segment["progress_message"],
                 ensure_ascii=False,
                 sort_keys=True,
                 indent=2,
@@ -507,13 +510,13 @@ def build_predecessor_review_body(
     )
 
 
-def upstream_assistant_message_token_count(
+def upstream_progress_message_token_count(
     upstream: str,
     model: str | None,
     message: dict,
 ) -> int:
-    if message.get("role") != "assistant":
-        raise ValueError("successor progress may contain assistant messages only")
+    if message.get("role") not in {"assistant", "tool"}:
+        raise ValueError("successor progress may contain assistant or tool messages only")
     if "reasoning" in message or "reasoning_content" in message:
         raise ValueError("successor progress must not contain reasoning fields")
     payload = {
@@ -538,6 +541,16 @@ def upstream_assistant_message_token_count(
     raise RuntimeError(f"unexpected tokenize response keys: {sorted(data)}")
 
 
+def upstream_assistant_message_token_count(
+    upstream: str,
+    model: str | None,
+    message: dict,
+) -> int:
+    if message.get("role") != "assistant":
+        raise ValueError("message must have assistant role")
+    return upstream_progress_message_token_count(upstream, model, message)
+
+
 def successor_token_count(
     upstream: str,
     model: str | None,
@@ -548,7 +561,7 @@ def successor_token_count(
     try:
         return (
             sum(
-                upstream_assistant_message_token_count(upstream, model, message)
+                upstream_progress_message_token_count(upstream, model, message)
                 for message in messages
             ),
             "upstream_chat_message_sum",
@@ -571,6 +584,7 @@ class GenerationCycle:
     predecessor_response_record: dict | None
     predecessor_response_message: dict | None
     successor_segments: list[dict] = field(default_factory=list)
+    seen_tool_results: set[str] = field(default_factory=set)
     review_started: bool = False
     letter: str | None = None
     letter_injected: bool = False
@@ -606,6 +620,7 @@ class ProxyState:
         self.seq = 0
         self.chat_request_count = 0
         self.chat_response_count = 0
+        self.progress_update_count = 0
         self.current_generation = 0
         self.compaction_event_count = 0
         self.cycles: dict[int, GenerationCycle] = {}
@@ -751,6 +766,11 @@ class ProxyState:
             self.chat_response_count += 1
             return self.chat_response_count
 
+    def note_progress_update(self) -> int:
+        with self.lock:
+            self.progress_update_count += 1
+            return self.progress_update_count
+
     def take_letter(self, generation: int) -> tuple[int, str] | None:
         with self.lock:
             cycle = self.active_cycle
@@ -779,6 +799,7 @@ class ProxyState:
         if assistant_message is None:
             return
         rendered = render_successor_text(successor_record)
+        progress_index = self.note_progress_update()
 
         with self.lock:
             cycle = self.active_cycle
@@ -791,12 +812,15 @@ class ProxyState:
                 return
             cycle.successor_segments.append(
                 {
+                    "kind": "assistant",
                     "seq": seq,
+                    "progress_index": progress_index,
                     "response_index": successor_index,
                     "generation": generation,
                     "event_index": cycle.event_index,
                     "text": rendered,
                     "assistant_message": assistant_message,
+                    "progress_message": assistant_message,
                     "reasoning_excluded": bool(
                         successor_record.get("reasoning")
                         or successor_record.get("reasoning_content")
@@ -804,30 +828,114 @@ class ProxyState:
                     "record": successor_record,
                 }
             )
+        self.maybe_run_review(seq, generation, progress_index, "assistant_response")
+
+    def note_tool_results(
+        self,
+        seq: int,
+        request_body: dict,
+        generation: int,
+    ) -> None:
+        with self.lock:
+            cycle = self.active_cycle
+            if (
+                cycle is None
+                or cycle.successor_generation != generation
+                or cycle.predecessor_request_body is None
+                or cycle.review_started
+            ):
+                return
+            tool_call_ids = {
+                str(call.get("id"))
+                for segment in cycle.successor_segments
+                if segment.get("kind") == "assistant"
+                for call in (segment.get("progress_message") or {}).get("tool_calls") or []
+                if call.get("id")
+            }
+            added = False
+            progress_index = self.progress_update_count
+            for message in request_body.get("messages") or []:
+                if message.get("role") != "tool":
+                    continue
+                tool_call_id = str(message.get("tool_call_id") or "")
+                if not tool_call_id or tool_call_id not in tool_call_ids:
+                    continue
+                normalized = {
+                    key: clone_json(value)
+                    for key, value in message.items()
+                    if key in {"role", "tool_call_id", "name", "content"}
+                }
+                identity = f"{tool_call_id}:{stable_sha256(normalized)}"
+                if identity in cycle.seen_tool_results:
+                    continue
+                cycle.seen_tool_results.add(identity)
+                self.progress_update_count += 1
+                progress_index = self.progress_update_count
+                cycle.successor_segments.append(
+                    {
+                        "kind": "tool_result",
+                        "seq": seq,
+                        "progress_index": progress_index,
+                        "response_index": None,
+                        "generation": generation,
+                        "event_index": cycle.event_index,
+                        "tool_call_id": tool_call_id,
+                        "text": json.dumps(
+                            normalized,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            indent=2,
+                        ),
+                        "progress_message": normalized,
+                        "reasoning_excluded": False,
+                        "record": None,
+                    }
+                )
+                added = True
+        if added:
+            self.maybe_run_review(seq, generation, progress_index, "tool_result")
+
+    def maybe_run_review(
+        self,
+        seq: int,
+        generation: int,
+        progress_index: int,
+        trigger_kind: str,
+    ) -> None:
+        with self.lock:
+            cycle = self.active_cycle
+            if (
+                cycle is None
+                or cycle.successor_generation != generation
+                or cycle.predecessor_request_body is None
+                or cycle.review_started
+            ):
+                return
             segments_snapshot = clone_json(cycle.successor_segments)
             event_index = cycle.event_index
             predecessor_body = clone_json(cycle.predecessor_request_body)
 
         progress_text = render_successor_progress(segments_snapshot)
-        assistant_messages = [segment["assistant_message"] for segment in segments_snapshot]
+        progress_messages = [segment["progress_message"] for segment in segments_snapshot]
         model = predecessor_body.get("model")
         progress_tokens, token_source, token_error = successor_token_count(
             self.upstream,
             model,
-            assistant_messages,
+            progress_messages,
         )
         ready_for_review = (
             progress_tokens is not None
             and progress_tokens >= self.successor_accum_tokens
         )
         dump_json(
-            self.log_dir / f"generation-{event_index:06d}-successor-accumulation-{successor_index:06d}.json",
+            self.log_dir / f"generation-{event_index:06d}-successor-accumulation-{progress_index:06d}.json",
             {
                 "event_index": event_index,
                 "predecessor_generation": generation - 1,
                 "successor_generation": generation,
                 "seq": seq,
-                "response_index": successor_index,
+                "progress_index": progress_index,
+                "trigger_kind": trigger_kind,
                 "time": utc_now(),
                 "tokens": progress_tokens,
                 "token_source": token_source,
@@ -835,11 +943,15 @@ class ProxyState:
                 "target_tokens": self.successor_accum_tokens,
                 "segment_count": len(segments_snapshot),
                 "ready_for_review": ready_for_review,
-                "counted_messages": assistant_messages,
+                "counted_messages": progress_messages,
                 "count_contract": {
-                    "included": ["assistant content", "assistant tool_calls"],
-                    "excluded": ["reasoning", "reasoning_content", "tool results"],
-                    "method": "sum of vLLM /tokenize counts for individually chat-templated completed assistant messages",
+                    "included": [
+                        "assistant content",
+                        "assistant tool_calls",
+                        "matching tool result messages",
+                    ],
+                    "excluded": ["reasoning", "reasoning_content"],
+                    "method": "sum of vLLM /tokenize counts for individually chat-templated completed assistant and matching tool-result messages",
                 },
                 "text": progress_text,
             },
@@ -870,7 +982,7 @@ class ProxyState:
                 self.log_dir / f"generation-{event_index:06d}-predecessor-review-error.json",
                 {
                     "event_index": event_index,
-                    "predecessor_generation": generation - 1,
+                    "predecessor_generation": cycle.predecessor_generation,
                     "successor_generation": generation,
                     "time": utc_now(),
                     "error": repr(exc),
@@ -1006,6 +1118,7 @@ class Handler(BaseHTTPRequestHandler):
         injected_letter_event_index = None
         forwarded_body = request_body
         if is_chat and not is_compaction:
+            state.note_tool_results(seq, request_json, request_generation)
             pending_letter = state.take_letter(request_generation)
             if pending_letter is not None:
                 injected_letter_event_index, injected_letter = pending_letter

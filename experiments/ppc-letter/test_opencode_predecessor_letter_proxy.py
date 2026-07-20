@@ -305,6 +305,98 @@ class PredecessorReviewBodyTest(unittest.TestCase):
                 ],
             )
 
+    def test_matching_tool_result_counts_once_and_can_trigger_review(self):
+        with TemporaryDirectory() as tmp:
+            state = ProxyState(
+                upstream="http://127.0.0.1:8000",
+                log_dir=Path(tmp),
+                predecessor_request=None,
+                review_max_tokens=2048,
+                successor_accum_tokens=10000,
+            )
+            generation, _ = self.capture_transition(
+                state,
+                self.sample_request(),
+                {"content": "predecessor response"},
+            )
+            successor = {
+                "content": "I will read the file.",
+                "tool_calls": "\n".join(
+                    [
+                        '{"id":"call_successor","type":"function","index":0,"function":{"name":"read","arguments":""}}',
+                        '{"id":"call_successor","type":"function","index":0,"function":{"name":null,"arguments":"{\\"filePath\\":\\"large.py\\"}"}}',
+                    ]
+                ),
+            }
+            request = {
+                "messages": [
+                    {"role": "tool", "tool_call_id": "old_call", "content": "old"},
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_successor",
+                        "content": "large tool output",
+                    },
+                ]
+            }
+
+            with (
+                patch(
+                    "opencode_predecessor_letter_proxy.successor_token_count",
+                    side_effect=[(500, "upstream", None), (10000, "upstream", None)],
+                ) as token_count,
+                patch(
+                    "opencode_predecessor_letter_proxy.run_predecessor_review",
+                    return_value="tool-aware note",
+                ) as review,
+            ):
+                state.maybe_review(20, successor, False, generation)
+                self.assertFalse(state.active_cycle.review_started)
+                state.note_tool_results(21, request, generation)
+
+            self.assertTrue(state.active_cycle.review_started)
+            self.assertEqual(state.active_cycle.letter, "tool-aware note")
+            self.assertEqual(
+                [segment["kind"] for segment in state.active_cycle.successor_segments],
+                ["assistant", "tool_result"],
+            )
+            counted = token_count.call_args_list[1].args[2]
+            self.assertEqual([message["role"] for message in counted], ["assistant", "tool"])
+            self.assertEqual(counted[1]["tool_call_id"], "call_successor")
+            review.assert_called_once()
+
+    def test_tool_result_is_deduplicated_before_threshold(self):
+        with TemporaryDirectory() as tmp:
+            state = ProxyState(
+                upstream="http://127.0.0.1:8000",
+                log_dir=Path(tmp),
+                predecessor_request=None,
+                review_max_tokens=2048,
+                successor_accum_tokens=10000,
+            )
+            generation, _ = self.capture_transition(
+                state,
+                self.sample_request(),
+                {"content": "predecessor response"},
+            )
+            successor = {
+                "tool_calls": '{"id":"call_1","type":"function","index":0,"function":{"name":"bash","arguments":"{}"}}'
+            }
+            request = {
+                "messages": [
+                    {"role": "tool", "tool_call_id": "call_1", "content": "output"}
+                ]
+            }
+            with patch(
+                "opencode_predecessor_letter_proxy.successor_token_count",
+                return_value=(100, "upstream", None),
+            ) as token_count:
+                state.maybe_review(20, successor, False, generation)
+                state.note_tool_results(21, request, generation)
+                state.note_tool_results(22, request, generation)
+
+            self.assertEqual(len(state.active_cycle.successor_segments), 2)
+            self.assertEqual(token_count.call_count, 2)
+
     def test_unavailable_tokenizer_never_triggers_review(self):
         with TemporaryDirectory() as tmp:
             state = ProxyState(

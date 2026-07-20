@@ -6,6 +6,7 @@ Branch policy:
 
 - `dev-trace` contains only opt-in tracing and must preserve pure OpenCode behavior when tracing is disabled.
 - `dev-trace-experiment-ppc-letter` adds the PPC predecessor-letter experiment on top of `dev-trace`.
+- `ppc-tool-results` is the experiment-0004 derivative pinned from the structured-letter implementation; it additionally counts matching tool-result messages and is not the 0002 baseline.
 - Future trace-only improvements should be merged into `dev-trace` first, then merged or rebased into this experiment branch.
 - Other experiments should branch from `dev-trace`, not from this branch.
 
@@ -49,11 +50,17 @@ letter, and injection state for the new generation. Event artifacts use a
 stable `generation-NNNNNN-*` prefix so repeated compactions remain separate.
 
 Only tokenized progress produced by that event's successor generation can
-trigger its review. The counted projection contains completed messages marked
-as `assistant`: visible `content` and complete assistant `tool_calls`. It excludes
-reasoning/thinking fields and tool-result messages. Each completed assistant
-message is independently chat-templated by the serving vLLM `/tokenize`
-endpoint, and those exact counts are summed toward the threshold. Request
+trigger its review. On `ppc-tool-results`, the counted projection contains
+completed assistant `content`, complete assistant `tool_calls`, and the matching
+`tool` messages that OpenCode supplies after executing those calls. Tool results
+are admitted only when their `tool_call_id` was generated in the active successor
+generation, and repeated history in later requests is deduplicated. Reasoning and
+thinking fields remain excluded. Each completed assistant or matching tool-result
+message is independently chat-templated by the serving vLLM `/tokenize` endpoint,
+and those exact counts are summed toward the threshold. When a tool result crosses
+the threshold, predecessor review completes synchronously before the pending
+successor request is forwarded, allowing the resulting letter to enter that same
+request. Request
 ordinals are retained in logs for correlation but never gate snapshot selection
 or review timing. If exact tokenization is unavailable, the proxy records the
 error and does not trigger a review from a character-count estimate.
