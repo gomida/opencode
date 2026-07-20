@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression tests for the PPC predecessor-letter proxy."""
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,6 +17,8 @@ from opencode_predecessor_letter_proxy import (
     predecessor_context_id,
     render_successor_text,
     stable_sha256,
+    successor_token_count,
+    tokenization_safe_progress_message,
 )
 
 
@@ -232,6 +235,55 @@ class PredecessorReviewBodyTest(unittest.TestCase):
         rendered = render_successor_text(record)
         self.assertNotIn("private chain", rendered)
         self.assertIn("engineio/server.py", rendered)
+
+    def test_tokenization_copy_escapes_nested_json_control_characters(self):
+        message = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_bad",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": '{"path\n/testbed/engineio/asyncio_server.py": ""}',
+                    },
+                }
+            ],
+        }
+
+        normalized, repairs = tokenization_safe_progress_message(message)
+
+        self.assertEqual(
+            message["tool_calls"][0]["function"]["arguments"],
+            '{"path\n/testbed/engineio/asyncio_server.py": ""}',
+        )
+        arguments = normalized["tool_calls"][0]["function"]["arguments"]
+        self.assertIn("\\n", arguments)
+        self.assertEqual(
+            json.loads(arguments),
+            {"path\n/testbed/engineio/asyncio_server.py": ""},
+        )
+        self.assertEqual(len(repairs), 1)
+
+    def test_successor_count_keeps_a_visible_lower_bound_after_one_failure(self):
+        messages = [
+            {"role": "assistant", "content": "bad"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "large output"},
+        ]
+        with patch(
+            "opencode_predecessor_letter_proxy.upstream_progress_message_token_count",
+            side_effect=[RuntimeError("bad nested JSON"), 6000],
+        ):
+            tokens, source, error = successor_token_count(
+                "http://127.0.0.1:8000",
+                "model",
+                messages,
+            )
+
+        self.assertEqual(tokens, 6000)
+        self.assertEqual(source, "upstream_chat_message_lower_bound")
+        self.assertIn("message[0]", error)
 
     def test_auto_capture_uses_last_non_compaction_before_compaction(self):
         with TemporaryDirectory() as tmp:

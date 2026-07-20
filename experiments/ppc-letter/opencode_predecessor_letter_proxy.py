@@ -548,6 +548,51 @@ def upstream_progress_message_token_count(
     raise RuntimeError(f"unexpected tokenize response keys: {sorted(data)}")
 
 
+def tokenization_safe_progress_message(message: dict) -> tuple[dict, list[str]]:
+    """Repair literal JSON control characters only in a tokenization copy.
+
+    Streaming tool-call arguments are model output and can contain literal
+    control characters inside an otherwise valid nested JSON document. The
+    outer request remains valid JSON, but chat templates commonly parse the
+    nested arguments again. Preserve the original message for artifacts and
+    predecessor review while minimally escaping those characters in the copy
+    sent to /tokenize.
+    """
+
+    normalized = clone_json(message)
+    repairs = []
+    if normalized.get("role") != "assistant":
+        return normalized, repairs
+    for index, call in enumerate(normalized.get("tool_calls") or []):
+        function = call.get("function") or {}
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            continue
+        try:
+            json.loads(arguments)
+            continue
+        except json.JSONDecodeError as exc:
+            if "Invalid control character" not in str(exc):
+                continue
+        escaped = "".join(
+            {
+                "\b": "\\b",
+                "\f": "\\f",
+                "\n": "\\n",
+                "\r": "\\r",
+                "\t": "\\t",
+            }.get(char, f"\\u{ord(char):04x}" if ord(char) < 0x20 else char)
+            for char in arguments
+        )
+        try:
+            json.loads(escaped)
+        except json.JSONDecodeError:
+            continue
+        function["arguments"] = escaped
+        repairs.append(f"tool_calls[{index}].function.arguments: escaped JSON control characters")
+    return normalized, repairs
+
+
 def upstream_assistant_message_token_count(
     upstream: str,
     model: str | None,
@@ -565,17 +610,21 @@ def successor_token_count(
 ) -> tuple[int | None, str, str | None]:
     if not messages:
         return 0, "empty", None
-    try:
-        return (
-            sum(
-                upstream_progress_message_token_count(upstream, model, message)
-                for message in messages
-            ),
-            "upstream_chat_message_sum",
-            None,
-        )
-    except Exception as exc:
-        return None, "unavailable", repr(exc)
+    total = 0
+    repairs = []
+    failures = []
+    for index, message in enumerate(messages):
+        normalized, message_repairs = tokenization_safe_progress_message(message)
+        repairs.extend(f"message[{index}] {repair}" for repair in message_repairs)
+        try:
+            total += upstream_progress_message_token_count(upstream, model, normalized)
+        except Exception as exc:
+            failures.append(f"message[{index}]: {exc!r}")
+    details = repairs + failures
+    if failures:
+        return total, "upstream_chat_message_lower_bound", "; ".join(details)
+    source = "upstream_chat_message_sum_normalized" if repairs else "upstream_chat_message_sum"
+    return total, source, "; ".join(details) or None
 
 
 @dataclass
