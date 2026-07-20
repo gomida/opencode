@@ -141,6 +141,13 @@ def clone_json(value):
     return json.loads(json.dumps(value, ensure_ascii=False))
 
 
+def apply_request_seed(request_body: dict, request_seed: int | None) -> dict:
+    seeded = clone_json(request_body)
+    if request_seed is not None:
+        seeded["seed"] = request_seed
+    return seeded
+
+
 def stable_json_bytes(value) -> bytes:
     return json.dumps(
         value,
@@ -603,6 +610,8 @@ class ProxyState:
         predecessor_request: Path | None,
         review_max_tokens: int,
         successor_accum_tokens: int,
+        request_seed: int | None = None,
+        predecessor_enabled: bool = True,
     ):
         self.upstream = upstream.rstrip("/") + "/"
         self.log_dir = log_dir
@@ -616,6 +625,8 @@ class ProxyState:
         self.last_non_compaction_response_message: dict | None = None
         self.review_max_tokens = review_max_tokens
         self.successor_accum_tokens = successor_accum_tokens
+        self.request_seed = request_seed
+        self.predecessor_enabled = predecessor_enabled
         self.lock = threading.Lock()
         self.seq = 0
         self.chat_request_count = 0
@@ -1112,12 +1123,20 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.lstrip("/")
         is_chat = self.command == "POST" and path.endswith("chat/completions") and isinstance(request_json, dict)
 
-        is_compaction = bool(is_chat and is_compaction_request_body(request_json))
+        forwarded_body = request_body
+        if is_chat:
+            request_json = apply_request_seed(request_json, state.request_seed)
+            forwarded_body = json.dumps(request_json).encode("utf-8")
+
+        is_compaction = bool(
+            is_chat
+            and state.predecessor_enabled
+            and is_compaction_request_body(request_json)
+        )
         request_generation = state.generation()
         injected_letter = None
         injected_letter_event_index = None
-        forwarded_body = request_body
-        if is_chat and not is_compaction:
+        if is_chat and state.predecessor_enabled and not is_compaction:
             state.note_tool_results(seq, request_json, request_generation)
             pending_letter = state.take_letter(request_generation)
             if pending_letter is not None:
@@ -1141,7 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
 
         chat_request_index = None
         compaction_event_index = None
-        if is_chat:
+        if is_chat and state.predecessor_enabled:
             chat_request_index = state.note_chat_request()
             request_generation, compaction_event_index = state.note_chat_request_body(
                 seq,
@@ -1205,6 +1224,8 @@ class Handler(BaseHTTPRequestHandler):
                 "generation": request_generation,
                 "compaction_event_index": compaction_event_index,
                 "is_compaction_request": is_compaction,
+                "request_seed": state.request_seed if is_chat else None,
+                "predecessor_enabled": state.predecessor_enabled,
                 "injected_predecessor_letter": injected_letter is not None,
                 "injected_predecessor_letter_event_index": injected_letter_event_index,
                 "headers": {k: v for k, v in self.headers.items()},
@@ -1292,6 +1313,8 @@ def main() -> int:
     parser.add_argument("--predecessor-request", type=Path)
     parser.add_argument("--review-max-tokens", type=int, default=2048)
     parser.add_argument("--successor-accum-tokens", type=int, default=DEFAULT_SUCCESSOR_ACCUM_TOKENS)
+    parser.add_argument("--request-seed", type=int)
+    parser.add_argument("--disable-predecessor-letter", action="store_true")
     args = parser.parse_args()
 
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), Handler)
@@ -1301,6 +1324,8 @@ def main() -> int:
         predecessor_request=args.predecessor_request,
         review_max_tokens=args.review_max_tokens,
         successor_accum_tokens=args.successor_accum_tokens,
+        request_seed=args.request_seed,
+        predecessor_enabled=not args.disable_predecessor_letter,
     )
     print(
         f"predecessor-letter proxy listening on {args.listen_host}:{args.listen_port} -> {args.upstream}",

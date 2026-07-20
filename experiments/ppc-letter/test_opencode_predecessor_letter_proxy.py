@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from opencode_predecessor_letter_proxy import (
     ProxyState,
+    apply_request_seed,
     assistant_message_from_successor_record,
     build_predecessor_review_body,
     is_compaction_request_body,
@@ -155,6 +156,14 @@ class PredecessorReviewBodyTest(unittest.TestCase):
         self.assertEqual(request["tools"][0]["function"]["description"], "Read a file")
         self.assertEqual(request["messages"][0]["content"], "You are OpenCode.")
         self.assertTrue(metadata["prefix_invariant_ok"])
+
+    def test_request_seed_is_applied_without_mutating_input(self):
+        request = self.sample_request()
+        seeded = apply_request_seed(request, 6001)
+
+        self.assertEqual(seeded["seed"], 6001)
+        self.assertNotIn("seed", request)
+        self.assertEqual(apply_request_seed(request, None), request)
 
     def test_schema_letter_is_normalized_for_injection(self):
         normalized = normalize_predecessor_letter(

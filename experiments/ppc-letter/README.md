@@ -49,6 +49,13 @@ generation as the new predecessor and resets successor accumulation, review,
 letter, and injection state for the new generation. Event artifacts use a
 stable `generation-NNNNNN-*` prefix so repeated compactions remain separate.
 
+The `paired-seed` derivative adds `--request-seed INTEGER`, which writes the
+same explicit vLLM sampling seed into every chat-completions request of one
+trial. `--disable-predecessor-letter` leaves that seed injection and request
+logging active but disables compaction tracking, predecessor review, and letter
+injection. Paired stock and treatment trials therefore traverse the same HTTP
+boundary while only the treatment enables the intervention.
+
 Only tokenized progress produced by that event's successor generation can
 trigger its review. On `ppc-tool-results`, the counted projection contains
 completed assistant `content`, complete assistant `tool_calls`, and the matching
