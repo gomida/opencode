@@ -190,11 +190,14 @@ export async function complete(input: {
   })
   if (cycle.tokens < input.cfg.threshold) return
   cycle.reviewStarted = true
+  const predecessorResponse = JSON.stringify(cycle.predecessor.response?.projection ?? [], null, 2)
   const successor = JSON.stringify(cycle.successor.flatMap((item) => item.projection), null, 2)
   const messages: ModelMessage[] = [
     ...clone(cycle.predecessor.messages),
-    ...clone(cycle.predecessor.response?.messages ?? []),
-    { role: "user", content: `${OPENING}\n\n${successor}\n\n${CLOSING}` },
+    {
+      role: "user",
+      content: `${OPENING}\n\nThe predecessor's final visible response was:\n${predecessorResponse}\n\nAccumulated successor progress:\n${successor}\n\n${CLOSING}`,
+    },
   ]
   await record(input.cfg, cycle.event, "review-request", {
     event: cycle.event,
