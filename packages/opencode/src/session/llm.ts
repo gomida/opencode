@@ -141,12 +141,12 @@ const live: Layer.Layer<
             letter: z.string().min(1),
           }),
           temperature: 0,
-          maxOutputTokens: Math.min(2_048, prepared.params.maxOutputTokens ?? 2_048),
+          maxOutputTokens: Math.min(8_192, prepared.params.maxOutputTokens ?? 8_192),
           providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
           headers: prepared.headers,
           abortSignal: input.abort,
           maxRetries: input.retries ?? 0,
-        }).then((result) => result.object)
+        }).then((result) => ({ ...result.object, usage: result.usage, finishReason: result.finishReason }))
       const ppcCfg = input.model.api.npm === "@ai-sdk/google" ? ExperimentalPPC.config() : undefined
       const ppc = ppcCfg
         ? yield* Effect.promise(() =>

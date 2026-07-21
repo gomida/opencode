@@ -1,5 +1,5 @@
 import { Token } from "@/util/token"
-import type { ModelMessage } from "ai"
+import { NoObjectGeneratedError, type ModelMessage } from "ai"
 import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 
@@ -56,6 +56,8 @@ export type ReviewInput = {
 export type ReviewOutput = {
   readonly status: "OK" | "WARN"
   readonly letter: string
+  readonly usage?: unknown
+  readonly finishReason?: string
 }
 
 const states = new Map<string, State>()
@@ -247,12 +249,23 @@ async function maybeReview(cfg: Config, cycle: Cycle, review: (input: ReviewInpu
       result = await review(input)
       break
     } catch (error) {
-      const parseFailure = error instanceof Error && error.name === "AI_NoObjectGeneratedError"
+      const parseFailure =
+        NoObjectGeneratedError.isInstance(error) || (error instanceof Error && error.name === "AI_NoObjectGeneratedError")
+      const details = NoObjectGeneratedError.isInstance(error)
+        ? {
+            error: String(error),
+            cause: String(error.cause),
+            text: error.text,
+            finishReason: error.finishReason,
+            usage: error.usage,
+            response: error.response,
+          }
+        : { error: String(error) }
       if (attempt === 1 && parseFailure) {
-        await record(cfg, cycle.event, "review-retry", { event: cycle.event, attempt, error: String(error) })
+        await record(cfg, cycle.event, "review-retry", { event: cycle.event, attempt, ...details })
         continue
       }
-      await record(cfg, cycle.event, "review-error", { event: cycle.event, attempt, error: String(error) })
+      await record(cfg, cycle.event, "review-error", { event: cycle.event, attempt, ...details })
       return
     }
   }
@@ -267,6 +280,8 @@ async function maybeReview(cfg: Config, cycle: Cycle, review: (input: ReviewInpu
     event: cycle.event,
     status: result.status,
     letter,
+    usage: result.usage,
+    finishReason: result.finishReason,
   })
 }
 
