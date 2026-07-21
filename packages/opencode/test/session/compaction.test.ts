@@ -1437,6 +1437,70 @@ describe("session.compaction.process", () => {
     { git: true },
   )
 
+  itCompaction.instance(
+    "frames an assistant-only retained suffix for repeated compaction",
+    () => {
+      const stub = llm()
+      let captured: LLM.StreamInput["messages"] = []
+      stub.push(reply("summary one"))
+      stub.push(
+        reply("summary two", (input) => {
+          captured = input.messages
+        }),
+      )
+
+      return Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "older context")
+        const recent = yield* createUserMessage(session.id, "recent turn")
+        const large = yield* createAssistantMessage(session.id, recent.id, test.directory)
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: large.id,
+          sessionID: session.id,
+          type: "text",
+          text: "z".repeat(2_000),
+        })
+        const keep = yield* createAssistantMessage(session.id, recent.id, test.directory)
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: keep.id,
+          sessionID: session.id,
+          type: "text",
+          text: "keep tail",
+        })
+        yield* createCompactionMarker(session.id)
+
+        let msgs = yield* ssn.messages({ sessionID: session.id })
+        let parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+
+        yield* createUserMessage(session.id, "latest turn")
+        yield* createCompactionMarker(session.id)
+        msgs = MessageV2.filterCompacted(yield* MessageV2.stream(session.id))
+        parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+
+        expect(captured[0]).toEqual({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "The following messages are a retained suffix of the conversation to summarize.",
+            },
+          ],
+        })
+        expect(captured[1]?.role).toBe("assistant")
+        expect(captured.at(-1)?.role).toBe("user")
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 100 }) }))
+    },
+    { git: true },
+  )
+
   itCompaction.instance("keeps recent pre-compaction turns across repeated compactions", () => {
     const stub = llm()
     stub.push(reply("summary one"))

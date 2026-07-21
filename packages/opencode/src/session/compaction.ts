@@ -392,6 +392,19 @@ const layer = Layer.effect(
         tools: {},
         system: [],
         messages: [
+          ...(modelMessages[0]?.role === "assistant"
+            ? [
+                {
+                  role: "user" as const,
+                  content: [
+                    {
+                      type: "text" as const,
+                      text: "The following messages are a retained suffix of the conversation to summarize.",
+                    },
+                  ],
+                },
+              ]
+            : []),
           ...modelMessages,
           {
             role: "user",
