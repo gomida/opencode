@@ -6,6 +6,13 @@ import * as ExperimentalPPC from "../../src/session/experimental-ppc"
 
 const user = (text: string): ModelMessage => ({ role: "user", content: text })
 const assistant = (text: string): ModelMessage => ({ role: "assistant", content: text })
+const assistantReasoning = (reasoning: string, text: string): ModelMessage => ({
+  role: "assistant",
+  content: [
+    { type: "reasoning", text: reasoning },
+    { type: "text", text },
+  ],
+})
 
 afterEach(() => ExperimentalPPC.reset())
 
@@ -80,6 +87,44 @@ describe("experimental native PPC", () => {
     })
     expect(next.messages).toHaveLength(injected.messages.length)
     expect(reviews).toBe(1)
+  })
+
+  test("counts exposed reasoning toward the successor threshold", async () => {
+    await using tmp = await tmpdir()
+    const cfg = { threshold: 100, logDir: path.join(tmp.path, "ppc") }
+    const first = await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: false, messages: [user("task")] })
+    await ExperimentalPPC.complete({
+      cfg,
+      sessionID: "s1",
+      requestID: first.requestID!,
+      messages: [assistant("predecessor response")],
+      review: async () => ({ status: "OK", letter: "unused" }),
+    })
+    await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: true, messages: [user("summary request")] })
+    const successor = await ExperimentalPPC.prepare({
+      cfg,
+      sessionID: "s1",
+      compaction: false,
+      messages: [user("summary"), user("continue")],
+    })
+    let reviews = 0
+    const reasoning = "public chain of thought ".repeat(20)
+    await ExperimentalPPC.complete({
+      cfg,
+      sessionID: "s1",
+      requestID: successor.requestID!,
+      messages: [assistantReasoning(reasoning, "short")],
+      review: async (input) => {
+        reviews++
+        expect(input.successor).toContain('"type": "reasoning"')
+        expect(input.successor).toContain(reasoning)
+        return { status: "OK", letter: "Use the preserved reasoning." }
+      },
+    })
+    expect(reviews).toBe(1)
+    const event = await Bun.file(path.join(cfg.logDir, "generation-000001-successor-000001.json")).json()
+    expect(event.tokens).toBeGreaterThanOrEqual(cfg.threshold)
+    expect(event.response[0].content[0]).toEqual({ type: "reasoning", text: reasoning })
   })
 
   test("starts a fresh cycle after a repeated compaction", async () => {

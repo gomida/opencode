@@ -87,6 +87,7 @@ function projection(message: ModelMessage) {
   const content: unknown[] = []
   for (const part of message.content) {
     if (part.type === "text") content.push({ type: "text", text: part.text })
+    if (part.type === "reasoning") content.push({ type: "reasoning", text: part.text })
     if (part.type === "tool-call") {
       content.push({ type: "tool-call", toolCallId: part.toolCallId, toolName: part.toolName, input: part.input })
     }
