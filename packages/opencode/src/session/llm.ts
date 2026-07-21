@@ -6,7 +6,8 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
-import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
+import { generateObject, streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
+import z from "zod"
 import type { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
@@ -29,6 +30,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import * as ExperimentalPPC from "./experimental-ppc"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -111,6 +113,18 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      const ppcCfg = input.model.api.npm === "@ai-sdk/google" ? ExperimentalPPC.config() : undefined
+      const ppc = ppcCfg
+        ? yield* Effect.promise(() =>
+            ExperimentalPPC.prepare({
+              cfg: ppcCfg,
+              sessionID: input.sessionID,
+              compaction: input.agent.name === "compaction",
+              messages: prepared.messages,
+            }),
+          )
+        : undefined
+      const requestMessages = ppc?.messages ?? prepared.messages
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -229,7 +243,7 @@ const live: Layer.Layer<
           provider: item,
           auth: info,
           llmClient,
-          messages: prepared.messages,
+          messages: requestMessages,
           tools: prepared.tools,
           toolChoice: input.toolChoice,
           temperature: prepared.params.temperature,
@@ -273,6 +287,40 @@ const live: Layer.Layer<
         "llm.provider": input.model.providerID,
         "llm.model": input.model.id,
       })
+      const wrapped = wrapLanguageModel({
+        model: language,
+        middleware: [
+          {
+            specificationVersion: "v3" as const,
+            async transformParams(args) {
+              if (args.type === "stream" || args.type === "generate") {
+                // @ts-expect-error
+                args.params.prompt = ProviderTransform.message(
+                  args.params.prompt,
+                  input.model,
+                  prepared.messageTransformOptions,
+                )
+              }
+              return args.params
+            },
+          },
+        ],
+      })
+      const review = (reviewInput: ExperimentalPPC.ReviewInput) =>
+        generateObject({
+          model: wrapped,
+          messages: reviewInput.messages,
+          schema: z.object({
+            status: z.enum(["OK", "WARN"]),
+            letter: z.string().min(1),
+          }),
+          temperature: 0,
+          maxOutputTokens: Math.min(2_048, prepared.params.maxOutputTokens ?? 2_048),
+          providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
+          headers: prepared.headers,
+          abortSignal: input.abort,
+          maxRetries: input.retries ?? 0,
+        }).then((result) => result.object)
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
@@ -321,26 +369,8 @@ const live: Layer.Layer<
           abortSignal: input.abort,
           headers: prepared.headers,
           maxRetries: input.retries ?? 0,
-          messages: prepared.messages,
-          model: wrapLanguageModel({
-            model: language,
-            middleware: [
-              {
-                specificationVersion: "v3" as const,
-                async transformParams(args) {
-                  if (args.type === "stream") {
-                    // @ts-expect-error
-                    args.params.prompt = ProviderTransform.message(
-                      args.params.prompt,
-                      input.model,
-                      prepared.messageTransformOptions,
-                    )
-                  }
-                  return args.params
-                },
-              },
-            ],
-          }),
+          messages: requestMessages,
+          model: wrapped,
           experimental_telemetry: {
             isEnabled: cfg.experimental?.openTelemetry,
             functionId: "session.llm",
@@ -351,6 +381,14 @@ const live: Layer.Layer<
             },
           },
         }),
+        ppc:
+          ppcCfg && ppc?.requestID
+            ? {
+                cfg: ppcCfg,
+                requestID: ppc.requestID,
+                review,
+              }
+            : undefined,
       }
     })
 
@@ -370,11 +408,27 @@ const live: Layer.Layer<
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
             const state = LLMAISDK.adapterState()
-            return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
+            const events = Stream.fromAsyncIterable(result.result.fullStream, (e) =>
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.flatMap((events) => Stream.fromIterable(events)),
+            )
+            if (!result.ppc) return events
+            const ppc = result.ppc
+            return events.pipe(
+              Stream.ensuring(
+                Effect.promise(async () => {
+                  const response = await result.result.response
+                  await ExperimentalPPC.complete({
+                    cfg: ppc.cfg,
+                    sessionID: input.sessionID,
+                    requestID: ppc.requestID,
+                    messages: response.messages,
+                    review: ppc.review,
+                  })
+                }),
+              ),
             )
           }),
         ),
