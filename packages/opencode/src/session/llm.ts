@@ -113,6 +113,40 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      const wrapped = wrapLanguageModel({
+        model: language,
+        middleware: [
+          {
+            specificationVersion: "v3" as const,
+            async transformParams(args) {
+              if (args.type === "stream" || args.type === "generate") {
+                // @ts-expect-error
+                args.params.prompt = ProviderTransform.message(
+                  args.params.prompt,
+                  input.model,
+                  prepared.messageTransformOptions,
+                )
+              }
+              return args.params
+            },
+          },
+        ],
+      })
+      const review = (reviewInput: ExperimentalPPC.ReviewInput) =>
+        generateObject({
+          model: wrapped,
+          messages: reviewInput.messages,
+          schema: z.object({
+            status: z.enum(["OK", "WARN"]),
+            letter: z.string().min(1),
+          }),
+          temperature: 0,
+          maxOutputTokens: Math.min(2_048, prepared.params.maxOutputTokens ?? 2_048),
+          providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
+          headers: prepared.headers,
+          abortSignal: input.abort,
+          maxRetries: input.retries ?? 0,
+        }).then((result) => result.object)
       const ppcCfg = input.model.api.npm === "@ai-sdk/google" ? ExperimentalPPC.config() : undefined
       const ppc = ppcCfg
         ? yield* Effect.promise(() =>
@@ -121,6 +155,7 @@ const live: Layer.Layer<
               sessionID: input.sessionID,
               compaction: input.agent.name === "compaction",
               messages: prepared.messages,
+              review,
             }),
           )
         : undefined
@@ -287,40 +322,6 @@ const live: Layer.Layer<
         "llm.provider": input.model.providerID,
         "llm.model": input.model.id,
       })
-      const wrapped = wrapLanguageModel({
-        model: language,
-        middleware: [
-          {
-            specificationVersion: "v3" as const,
-            async transformParams(args) {
-              if (args.type === "stream" || args.type === "generate") {
-                // @ts-expect-error
-                args.params.prompt = ProviderTransform.message(
-                  args.params.prompt,
-                  input.model,
-                  prepared.messageTransformOptions,
-                )
-              }
-              return args.params
-            },
-          },
-        ],
-      })
-      const review = (reviewInput: ExperimentalPPC.ReviewInput) =>
-        generateObject({
-          model: wrapped,
-          messages: reviewInput.messages,
-          schema: z.object({
-            status: z.enum(["OK", "WARN"]),
-            letter: z.string().min(1),
-          }),
-          temperature: 0,
-          maxOutputTokens: Math.min(2_048, prepared.params.maxOutputTokens ?? 2_048),
-          providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
-          headers: prepared.headers,
-          abortSignal: input.abort,
-          maxRetries: input.retries ?? 0,
-        }).then((result) => result.object)
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {

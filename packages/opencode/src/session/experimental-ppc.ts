@@ -34,6 +34,8 @@ type Cycle = {
   letter?: string
   injected: boolean
   superseded: boolean
+  toolCallIDs: Set<string>
+  seenToolResults: Set<string>
 }
 
 type State = {
@@ -110,6 +112,43 @@ function response(messages: ModelMessage[]): Response | undefined {
   }
 }
 
+function toolResponse(messages: ModelMessage[], cycle: Cycle): Response | undefined {
+  const projected: unknown[] = []
+  for (const message of messages) {
+    if (message.role !== "tool" || !Array.isArray(message.content)) continue
+    const content: unknown[] = []
+    for (const part of message.content) {
+      if (part.type !== "tool-result" || !cycle.toolCallIDs.has(part.toolCallId)) continue
+      const item = {
+        type: "tool-result",
+        toolCallId: part.toolCallId,
+        toolName: part.toolName,
+        output: clone(part.output),
+      }
+      const identity = JSON.stringify(item)
+      if (cycle.seenToolResults.has(identity)) continue
+      cycle.seenToolResults.add(identity)
+      content.push(item)
+    }
+    if (content.length) projected.push({ role: "tool", content })
+  }
+  if (!projected.length) return
+  return {
+    messages: clone(projected) as ModelMessage[],
+    projection: projected,
+    tokens: Token.estimate(JSON.stringify(projected)),
+  }
+}
+
+function noteToolCalls(cycle: Cycle, messages: ModelMessage[]) {
+  for (const message of messages) {
+    if (message.role !== "assistant" || typeof message.content === "string") continue
+    for (const part of message.content) {
+      if (part.type === "tool-call") cycle.toolCallIDs.add(part.toolCallId)
+    }
+  }
+}
+
 function filename(event: number, suffix: string) {
   return `generation-${event.toString().padStart(6, "0")}-${suffix}.json`
 }
@@ -124,6 +163,7 @@ export async function prepare(input: {
   readonly sessionID: string
   readonly compaction: boolean
   readonly messages: ModelMessage[]
+  readonly review?: (input: ReviewInput) => Promise<ReviewOutput>
 }) {
   const current = state(input.sessionID)
   if (input.compaction) {
@@ -139,6 +179,8 @@ export async function prepare(input: {
       reviewStarted: false,
       injected: false,
       superseded: false,
+      toolCallIDs: new Set(),
+      seenToolResults: new Set(),
     }
     await record(input.cfg, current.event, "capture", {
       event: current.event,
@@ -151,6 +193,20 @@ export async function prepare(input: {
 
   let messages = input.messages
   const cycle = current.cycle
+  const tools = cycle && !cycle.superseded && !cycle.reviewStarted ? toolResponse(input.messages, cycle) : undefined
+  if (cycle && tools) {
+    cycle.successor.push(tools)
+    cycle.tokens += tools.tokens
+    await record(input.cfg, cycle.event, `successor-${cycle.successor.length.toString().padStart(6, "0")}`, {
+      event: cycle.event,
+      triggerKind: "tool-result",
+      tokens: cycle.tokens,
+      targetTokens: input.cfg.threshold,
+      readyForReview: cycle.tokens >= input.cfg.threshold,
+      response: tools.projection,
+    })
+    if (input.review) await maybeReview(input.cfg, cycle, input.review)
+  }
   if (cycle?.letter && !cycle.injected && !cycle.superseded) {
     messages = [
       ...messages,
@@ -167,6 +223,40 @@ export async function prepare(input: {
   return { messages, requestID: current.request }
 }
 
+async function maybeReview(cfg: Config, cycle: Cycle, review: (input: ReviewInput) => Promise<ReviewOutput>) {
+  if (cycle.superseded || cycle.reviewStarted || cycle.tokens < cfg.threshold) return
+  cycle.reviewStarted = true
+  const predecessorResponse = JSON.stringify(cycle.predecessor.response?.projection ?? [], null, 2)
+  const successor = JSON.stringify(cycle.successor.flatMap((item) => item.projection), null, 2)
+  const messages: ModelMessage[] = [
+    ...clone(cycle.predecessor.messages),
+    {
+      role: "user",
+      content: `${OPENING}\n\nThe predecessor's final visible response was:\n${predecessorResponse}\n\nAccumulated successor progress:\n${successor}\n\n${CLOSING}`,
+    },
+  ]
+  await record(cfg, cycle.event, "review-request", {
+    event: cycle.event,
+    tokens: cycle.tokens,
+    messages,
+  })
+  await review({ messages, successor, event: cycle.event, tokens: cycle.tokens }).then(
+    async (result) => {
+      const letter = result.letter.trim()
+      if (!letter) throw new Error("predecessor letter is empty")
+      cycle.letter = `STATUS: ${result.status}\nLETTER:\n${letter}`
+      await record(cfg, cycle.event, "review-response", {
+        event: cycle.event,
+        status: result.status,
+        letter,
+      })
+    },
+    async (error) => {
+      await record(cfg, cycle.event, "review-error", { event: cycle.event, error: String(error) })
+    },
+  )
+}
+
 export async function complete(input: {
   readonly cfg: Config
   readonly sessionID: string
@@ -180,6 +270,7 @@ export async function complete(input: {
   if (current.last?.id === input.requestID) current.last.response = completed
   const cycle = current.cycle
   if (!cycle || cycle.superseded || cycle.reviewStarted) return
+  noteToolCalls(cycle, input.messages)
   cycle.successor.push(completed)
   cycle.tokens += completed.tokens
   await record(input.cfg, cycle.event, `successor-${cycle.successor.length.toString().padStart(6, "0")}`, {
@@ -189,37 +280,7 @@ export async function complete(input: {
     readyForReview: cycle.tokens >= input.cfg.threshold,
     response: completed.projection,
   })
-  if (cycle.tokens < input.cfg.threshold) return
-  cycle.reviewStarted = true
-  const predecessorResponse = JSON.stringify(cycle.predecessor.response?.projection ?? [], null, 2)
-  const successor = JSON.stringify(cycle.successor.flatMap((item) => item.projection), null, 2)
-  const messages: ModelMessage[] = [
-    ...clone(cycle.predecessor.messages),
-    {
-      role: "user",
-      content: `${OPENING}\n\nThe predecessor's final visible response was:\n${predecessorResponse}\n\nAccumulated successor progress:\n${successor}\n\n${CLOSING}`,
-    },
-  ]
-  await record(input.cfg, cycle.event, "review-request", {
-    event: cycle.event,
-    tokens: cycle.tokens,
-    messages,
-  })
-  await input.review({ messages, successor, event: cycle.event, tokens: cycle.tokens }).then(
-    async (result) => {
-      const letter = result.letter.trim()
-      if (!letter) throw new Error("predecessor letter is empty")
-      cycle.letter = `STATUS: ${result.status}\nLETTER:\n${letter}`
-      await record(input.cfg, cycle.event, "review-response", {
-        event: cycle.event,
-        status: result.status,
-        letter,
-      })
-    },
-    async (error) => {
-      await record(input.cfg, cycle.event, "review-error", { event: cycle.event, error: String(error) })
-    },
-  )
+  await maybeReview(input.cfg, cycle, input.review)
 }
 
 export function reset() {

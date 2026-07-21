@@ -13,6 +13,15 @@ const assistantReasoning = (reasoning: string, text: string): ModelMessage => ({
     { type: "text", text },
   ],
 })
+const assistantToolCall = (toolCallId: string): ModelMessage => ({
+  role: "assistant",
+  content: [{ type: "tool-call", toolCallId, toolName: "bash", input: { command: "pytest" } }],
+})
+const toolResult = (toolCallId: string, value: string): ModelMessage =>
+  ({
+    role: "tool",
+    content: [{ type: "tool-result", toolCallId, toolName: "bash", output: { type: "text", value } }],
+  }) as ModelMessage
 
 afterEach(() => ExperimentalPPC.reset())
 
@@ -159,6 +168,65 @@ describe("experimental native PPC", () => {
     release()
     await pending
     expect(completed).toBe(true)
+  })
+
+  test("counts a matching tool result once and injects its review into the carrying request", async () => {
+    await using tmp = await tmpdir()
+    const cfg = { threshold: 200, logDir: path.join(tmp.path, "ppc") }
+    const first = await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: false, messages: [user("task")] })
+    await ExperimentalPPC.complete({
+      cfg,
+      sessionID: "s1",
+      requestID: first.requestID!,
+      messages: [assistant("predecessor response")],
+      review: async () => ({ status: "OK", letter: "unused" }),
+    })
+    await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: true, messages: [user("summary request")] })
+    const call = assistantToolCall("call-1")
+    const successor = await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: false, messages: [user("continue")] })
+    let reviews = 0
+    await ExperimentalPPC.complete({
+      cfg,
+      sessionID: "s1",
+      requestID: successor.requestID!,
+      messages: [call],
+      review: async () => {
+        reviews++
+        return { status: "OK", letter: "unused" }
+      },
+    })
+    expect(reviews).toBe(0)
+
+    const result = toolResult("call-1", "test output ".repeat(100))
+    const carried = await ExperimentalPPC.prepare({
+      cfg,
+      sessionID: "s1",
+      compaction: false,
+      messages: [user("continue"), call, result],
+      review: async (input) => {
+        reviews++
+        expect(input.successor).toContain('"type": "tool-result"')
+        expect(input.successor).toContain("test output")
+        return { status: "WARN", letter: "Use the test result." }
+      },
+    })
+    expect(reviews).toBe(1)
+    expect(carried.messages.at(-1)).toEqual({
+      role: "user",
+      content: "STATUS: WARN\nLETTER:\nUse the test result.",
+    })
+
+    await ExperimentalPPC.prepare({
+      cfg,
+      sessionID: "s1",
+      compaction: false,
+      messages: [user("continue"), call, result],
+      review: async () => {
+        reviews++
+        return { status: "OK", letter: "duplicate" }
+      },
+    })
+    expect(reviews).toBe(1)
   })
 
   test("starts a fresh cycle after a repeated compaction", async () => {
