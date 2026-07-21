@@ -127,6 +127,40 @@ describe("experimental native PPC", () => {
     expect(event.response[0].content[0]).toEqual({ type: "reasoning", text: reasoning })
   })
 
+  test("blocks successor completion until the predecessor review finishes", async () => {
+    await using tmp = await tmpdir()
+    const cfg = { threshold: 1, logDir: path.join(tmp.path, "ppc") }
+    const first = await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: false, messages: [user("task")] })
+    await ExperimentalPPC.complete({
+      cfg,
+      sessionID: "s1",
+      requestID: first.requestID!,
+      messages: [assistant("predecessor response")],
+      review: async () => ({ status: "OK", letter: "unused" }),
+    })
+    await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: true, messages: [user("summary request")] })
+    const successor = await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: false, messages: [user("continue")] })
+
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    let completed = false
+    const pending = ExperimentalPPC.complete({
+      cfg,
+      sessionID: "s1",
+      requestID: successor.requestID!,
+      messages: [assistant("successor progress")],
+      review: async () => {
+        await gate
+        return { status: "WARN", letter: "Waited for predecessor review." }
+      },
+    }).then(() => (completed = true))
+    await Bun.sleep(10)
+    expect(completed).toBe(false)
+    release()
+    await pending
+    expect(completed).toBe(true)
+  })
+
   test("starts a fresh cycle after a repeated compaction", async () => {
     await using tmp = await tmpdir()
     const cfg = { threshold: 10_000, logDir: path.join(tmp.path, "ppc") }
