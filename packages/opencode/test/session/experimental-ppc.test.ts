@@ -229,6 +229,44 @@ describe("experimental native PPC", () => {
     expect(reviews).toBe(1)
   })
 
+  test("retries one structured review parse failure", async () => {
+    await using tmp = await tmpdir()
+    const cfg = { threshold: 1, logDir: path.join(tmp.path, "ppc") }
+    const first = await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: false, messages: [user("task")] })
+    await ExperimentalPPC.complete({
+      cfg,
+      sessionID: "s1",
+      requestID: first.requestID!,
+      messages: [assistant("predecessor response")],
+      review: async () => ({ status: "OK", letter: "unused" }),
+    })
+    await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: true, messages: [user("summary request")] })
+    const successor = await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: false, messages: [user("continue")] })
+    let attempts = 0
+    await ExperimentalPPC.complete({
+      cfg,
+      sessionID: "s1",
+      requestID: successor.requestID!,
+      messages: [assistant("successor progress")],
+      review: async () => {
+        attempts++
+        if (attempts === 1) {
+          const error = new Error("No object generated: could not parse the response.")
+          error.name = "AI_NoObjectGeneratedError"
+          throw error
+        }
+        return { status: "WARN", letter: "Recovered review." }
+      },
+    })
+    expect(attempts).toBe(2)
+    expect(await Bun.file(path.join(cfg.logDir, "generation-000001-review-retry.json")).exists()).toBe(true)
+    const carried = await ExperimentalPPC.prepare({ cfg, sessionID: "s1", compaction: false, messages: [user("next")] })
+    expect(carried.messages.at(-1)).toEqual({
+      role: "user",
+      content: "STATUS: WARN\nLETTER:\nRecovered review.",
+    })
+  })
+
   test("starts a fresh cycle after a repeated compaction", async () => {
     await using tmp = await tmpdir()
     const cfg = { threshold: 10_000, logDir: path.join(tmp.path, "ppc") }

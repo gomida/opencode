@@ -240,21 +240,34 @@ async function maybeReview(cfg: Config, cycle: Cycle, review: (input: ReviewInpu
     tokens: cycle.tokens,
     messages,
   })
-  await review({ messages, successor, event: cycle.event, tokens: cycle.tokens }).then(
-    async (result) => {
-      const letter = result.letter.trim()
-      if (!letter) throw new Error("predecessor letter is empty")
-      cycle.letter = `STATUS: ${result.status}\nLETTER:\n${letter}`
-      await record(cfg, cycle.event, "review-response", {
-        event: cycle.event,
-        status: result.status,
-        letter,
-      })
-    },
-    async (error) => {
-      await record(cfg, cycle.event, "review-error", { event: cycle.event, error: String(error) })
-    },
-  )
+  const input = { messages, successor, event: cycle.event, tokens: cycle.tokens }
+  let result: ReviewOutput | undefined
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      result = await review(input)
+      break
+    } catch (error) {
+      const parseFailure = error instanceof Error && error.name === "AI_NoObjectGeneratedError"
+      if (attempt === 1 && parseFailure) {
+        await record(cfg, cycle.event, "review-retry", { event: cycle.event, attempt, error: String(error) })
+        continue
+      }
+      await record(cfg, cycle.event, "review-error", { event: cycle.event, attempt, error: String(error) })
+      return
+    }
+  }
+  if (!result) return
+  const letter = result.letter.trim()
+  if (!letter) {
+    await record(cfg, cycle.event, "review-error", { event: cycle.event, attempt: 2, error: "predecessor letter is empty" })
+    return
+  }
+  cycle.letter = `STATUS: ${result.status}\nLETTER:\n${letter}`
+  await record(cfg, cycle.event, "review-response", {
+    event: cycle.event,
+    status: result.status,
+    letter,
+  })
 }
 
 export async function complete(input: {
